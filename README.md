@@ -18,7 +18,9 @@ crate. devenv (stable Rust).
 
 ```rust
 let mut config = nrf52_rax::Config::new(nrf52_rax::Variant::Nrf52833);
-config.images.push((0x0000_0000, softdevice)); // optional: an MBR and SoftDevice, a bootloader
+config.images.push((0x0007_8000, bootloader)); // optional: images before the ELF (a bootloader)
+config.boot_address = 0x2_7000; // optional, with the next line: an application above S140 7.x
+config.softdevice = true; // and the SoftDevice model in place of S140
 let mut chip = nrf52_rax::Nrf52::new(config, &elf)?;
 chip.periph().uarte[0].receive(b"\x02\x01\x00", chip.now()); // the board sends on RXD
 let event = chip.run_for(1_000_000_000); // picoseconds: 1 ms
@@ -35,7 +37,7 @@ keeps the flash, the UICR, the RAM and the retained registers; `resets` lists th
 the peripherals: `set_input`/`level` for the pins, `watcher` for their changes, `uarte[n]` for the
 UART lines, `i2c` for the I2C buses (named by their SCL pin, so the firmware finds a device wherever
 it routes the instance), `temp` for the die temperature, `log` and `trace` for the accesses.
-`rtt_read` reads a SEGGER RTT up buffer (defmt).
+`rtt_read` reads a SEGGER RTT up buffer (defmt). `softdevice()` gives the SoftDevice model (below).
 
 The `run` example boots an ELF headless and prints the defmt logs, the UART bytes and the accesses to
 peripherals not modelled:
@@ -43,7 +45,32 @@ peripherals not modelled:
 ```sh
 cargo run --release --example run -- --variant 52833 --ms 2000 firmware.elf
 cargo run --release --example run -- --variant 52840 --boot 26000 --i2c 0.20:3c app-above-s140.elf
+cargo run --release --example run -- --variant 52833 --boot 27000 --softdevice ble-app.elf
 ```
+
+## SoftDevice
+
+The RADIO is not modelled, so a SoftDevice image cannot run. `Config::softdevice` puts a model of
+one in its place, at its interface (S132/S140 7.x): an application linked above a SoftDevice boots
+at its own address with no SoftDevice image, each `svc #n` it makes (the `sd_*` calls) is answered at
+once, and the stack's events wait for `sd_ble_evt_get` with SWI2/EGU2 pended, as with the real one.
+`softdevice()` gives the board the other end of the BLE connection:
+
+- the firmware as a peripheral: its GATT server (`characteristic`), its advertising set
+  (`advertising`), a central on the board that connects (`central_connect`) and writes
+  (`central_write`), the notifications the firmware sends (`host`);
+- the firmware as a central: the board's peripheral (`peer`, a `Peer` with its GATT table and its
+  address, reachable while `present`), which the firmware connects to through its whitelist,
+  discovers (primary services, characteristics, descriptors), reads, writes (`host`) and receives
+  notifications from (`peer_notify`).
+
+What the board's end sends reaches the firmware a connection interval (15 ms) later, in order. One
+connection; GAP and GATT calls that change nothing the model keeps (connection parameters, PHY, data
+length, TX power, configuration) succeed; the SoC calls act on the peripherals (PPI, POWER, CLOCK,
+the flash through the NVMC). Not modelled: security (pairing, bonding, encryption), indications,
+L2CAP channels, scan reports, the timeslot API, `sd_ecb_block_encrypt`: they return
+`NRF_ERROR_NOT_SUPPORTED` and are logged. Checked with nrf-softdevice applications (embassy), as
+peripheral and as central.
 
 ## Model
 
@@ -64,7 +91,8 @@ cargo run --release --example run -- --variant 52840 --boot 26000 --i2c 0.20:3c 
 | EGU0-5, RNG, TEMP, WDT | triggers; random bytes every 30 µs (120 µs with bias correction); the board's temperature 36 µs after START; the watchdog's timeout and reset |
 | Others | registers that keep what is written; the first access to each is logged with its PC |
 
-Not modelled: the RADIO and the crypto blocks (ECB, CCM, AAR), so a SoftDevice does not run yet; SPIM,
-SPIS, TWIS and the legacy UART, TWI and SPI; SAADC, PWM, QDEC, COMP, PDM, I2S, NFCT, USBD, QSPI; the
-EasyDMA list mode; clock stretching; the MPU (stored, not enforced) and the MWU; RAM retention
-settings in System OFF (the RAM is kept); the CPU stalls of flash programming.
+Not modelled: the RADIO and the crypto blocks (ECB, CCM, AAR), so a SoftDevice image does not run
+(its model above stands in for it); SPIM, SPIS, TWIS and the legacy UART, TWI and SPI; SAADC, PWM,
+QDEC, COMP, PDM, I2S, NFCT, USBD, QSPI; the EasyDMA list mode; clock stretching; the MPU (stored, not
+enforced) and the MWU; RAM retention settings in System OFF (the RAM is kept); the CPU stalls of
+flash programming.

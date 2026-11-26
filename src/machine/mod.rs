@@ -14,6 +14,10 @@
 //! A system reset (SYSRESETREQ, the watchdog, a wake from System OFF)
 //! resets the core and the peripherals; the flash, the UICR, the RAM and the
 //! retained registers stay.
+//!
+//! With [`Config::softdevice`], a supervisor call is answered by the
+//! SoftDevice model ([`crate::softdevice`]) as soon as the instruction runs,
+//! and the stack's events pend SWI2/EGU2.
 
 mod bus;
 
@@ -30,6 +34,7 @@ pub use bus::{CODE_RAM, FICR, RAM_BASE, UICR};
 
 use crate::devices::clock::{RESET_DOG, RESET_SREQ};
 use crate::devices::{Clock, Dma, Peripherals};
+use crate::softdevice::{EVENT_IRQ, Guest, SoftDevice};
 use crate::variant::Variant;
 
 /// Instructions between two looks at the peripherals.
@@ -55,6 +60,10 @@ pub struct Config {
     /// Images loaded before the ELF: (address, bytes) in the flash, the
     /// UICR or the RAM (a SoftDevice, a bootloader, UICR settings).
     pub images: Vec<(u32, Vec<u8>)>,
+    /// Answer the SoftDevice's supervisor calls (an application linked
+    /// above a SoftDevice, booted at its own address with no SoftDevice
+    /// image).
+    pub softdevice: bool,
 }
 
 impl Config {
@@ -66,6 +75,7 @@ impl Config {
             seed: 1,
             boot_address: 0,
             images: Vec::new(),
+            softdevice: false,
         }
     }
 }
@@ -98,6 +108,32 @@ pub struct Nrf52 {
     pub asleep: u64,
     /// Chip resets since power-on, with their RESETREAS bit.
     pub resets: Vec<u32>,
+    softdevice: Option<SoftDevice>,
+    /// Supervisor calls with no SoftDevice to answer them, noted once.
+    svc_noted: bool,
+}
+
+/// The core's registers and memory, as a SoftDevice call sees them.
+struct CoreGuest<'a>(&'a mut CortexMCpu);
+
+impl Guest for CoreGuest<'_> {
+    fn reg(&self, n: u8) -> u32 {
+        self.0.get_gpr(n) as u32
+    }
+    fn set_reg(&mut self, n: u8, value: u32) {
+        self.0.set_gpr(n, u64::from(value));
+    }
+    fn read(&self, address: u32, len: usize) -> Option<Vec<u8>> {
+        let mut buf = vec![0; len];
+        self.0
+            .memory()
+            .read(u64::from(address), &mut buf)
+            .ok()
+            .map(|()| buf)
+    }
+    fn write(&mut self, address: u32, data: &[u8]) -> bool {
+        self.0.memory_mut().write(u64::from(address), data).is_ok()
+    }
 }
 
 impl Nrf52 {
@@ -157,6 +193,8 @@ impl Nrf52 {
             instructions: 0,
             asleep: 0,
             resets: Vec::new(),
+            softdevice: cfg.softdevice.then(SoftDevice::new),
+            svc_noted: false,
         };
         machine.cpu.reset();
         machine.service();
@@ -170,6 +208,7 @@ impl Nrf52 {
     /// A chip reset for `reason` (a RESETREAS bit).
     fn reset_chip(&mut self, reason: u32) {
         self.periph().reset(reason);
+        self.softdevice = self.softdevice.take().map(SoftDevice::after_reset);
         self.cpu.reset();
         self.off = false;
         self.resets.push(reason);
@@ -187,6 +226,11 @@ impl Nrf52 {
 
     pub fn cpu(&self) -> &CortexMCpu {
         &self.cpu
+    }
+
+    /// The SoftDevice model, with [`Config::softdevice`].
+    pub fn softdevice(&mut self) -> Option<&mut SoftDevice> {
+        self.softdevice.as_mut()
     }
 
     /// Virtual time, picoseconds.
@@ -273,6 +317,7 @@ impl Nrf52 {
                         break;
                     }
                     Ok(CpuExit::Breakpoint(imm)) => return Some(Event::Breakpoint { pc, imm }),
+                    Ok(CpuExit::Svc(imm)) => self.supervisor_call(imm),
                     Ok(_) => {}
                     Err(e) => {
                         return Some(Event::Fault {
@@ -308,6 +353,28 @@ impl Nrf52 {
             }
         }
         None
+    }
+
+    /// A supervisor call: answered by the SoftDevice model if there is one.
+    fn supervisor_call(&mut self, imm: u32) {
+        let now = self.now;
+        let answered = match self.softdevice.as_mut() {
+            Some(sd) => {
+                let answered = sd.call(imm, &mut CoreGuest(&mut self.cpu), now);
+                if sd.take_irq() {
+                    self.cpu.nvic_mut().set_pending(EVENT_IRQ);
+                }
+                answered
+            }
+            None => false,
+        };
+        if !answered && !self.svc_noted {
+            self.svc_noted = true;
+            let pc = self.pc();
+            self.periph().log.push(format!(
+                "SVC #{imm} at {pc:#010x} not answered (no SoftDevice)"
+            ));
+        }
     }
 
     /// Sleeps until `target`, or SysTick's next interrupt before it.
@@ -352,6 +419,23 @@ impl Nrf52 {
         for irq in lines {
             if !nvic.is_pending(irq) && !nvic.is_active(irq) {
                 nvic.set_pending(irq);
+            }
+        }
+        if let Some(sd) = self.softdevice.as_mut() {
+            sd.poll(self.now);
+            if let Some(t) = sd.next_arrival() {
+                self.next_event = Some(self.next_event.map_or(t, |n| n.min(t)));
+            }
+            if sd.take_irq() {
+                self.cpu.nvic_mut().set_pending(EVENT_IRQ);
+            }
+            if !sd.notes.is_empty() {
+                let notes = std::mem::take(&mut sd.notes);
+                periph
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .log
+                    .extend(notes);
             }
         }
     }

@@ -2,7 +2,12 @@
 //! the defmt logs (RTT up buffer 0), the bytes the UARTEs send, the first
 //! accesses to peripherals not modelled, and why it stopped.
 //!
-//! run [--variant 52832|52833|52840] [--ms N] [--hex FILE]... [--boot ADDRESS] [--i2c PORT.PIN:ADDR]... [--trace START:END] ELF
+//! run [--variant 52832|52833|52840] [--ms N] [--hex FILE]... [--boot ADDRESS] [--softdevice]
+//!     [--i2c PORT.PIN:ADDR]... [--trace START:END] ELF
+//!
+//! `--softdevice` answers the SoftDevice's calls (with `--boot 27000` for an
+//! application linked above S140 7.x) and prints what happens on its BLE
+//! connection; nobody connects.
 
 use std::time::Instant;
 
@@ -75,6 +80,7 @@ fn main() -> Result<(), String> {
     let mut images = Vec::new();
     let mut trace = None;
     let mut boot = 0;
+    let mut softdevice = false;
     let mut sinks: Vec<(u32, u8)> = Vec::new();
     let mut elf_path = None;
     let mut args = std::env::args().skip(1);
@@ -93,6 +99,7 @@ fn main() -> Result<(), String> {
                 boot = u32::from_str_radix(v.trim_start_matches("0x"), 16)
                     .map_err(|e| e.to_string())?;
             }
+            "--softdevice" => softdevice = true,
             "--i2c" => {
                 // PORT.PIN of SCL, and the 7-bit address in hex: 0.27:3c
                 let v = args.next().ok_or("--i2c PORT.PIN:ADDRESS")?;
@@ -132,6 +139,7 @@ fn main() -> Result<(), String> {
     let mut config = Config::new(variant);
     config.images = images;
     config.boot_address = boot;
+    config.softdevice = softdevice;
     let mut chip = Nrf52::new(config, &elf)?;
     chip.periph().trace = trace;
     let written = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -149,6 +157,7 @@ fn main() -> Result<(), String> {
 
     let started = Instant::now();
     let mut logged = 0;
+    let mut advertised: Option<(bool, Vec<u8>)> = None;
     let mut stop = None;
     for _ in 0..ms {
         let event = chip.run_for(PS_PER_MS);
@@ -196,6 +205,27 @@ fn main() -> Result<(), String> {
         }
         logged = p.log.len();
         drop(p);
+        let now_ms = chip.now() as f64 / PS_PER_MS as f64;
+        if let Some(sd) = chip.softdevice() {
+            for e in sd.host.drain(..) {
+                println!("{now_ms:>10.3} ms  BLE {e:?}");
+            }
+            let adv = sd.advertising().map(|a| (a.connectable, a.data.clone()));
+            if adv != advertised {
+                match &adv {
+                    Some((connectable, data)) => {
+                        let hex: Vec<String> = data.iter().map(|b| format!("{b:02x}")).collect();
+                        println!(
+                            "{now_ms:>10.3} ms  BLE advertising{}: {}",
+                            if *connectable { ", connectable" } else { "" },
+                            hex.join(" ")
+                        );
+                    }
+                    None => println!("{now_ms:>10.3} ms  BLE not advertising"),
+                }
+                advertised = adv;
+            }
+        }
         if let Some(event) = event {
             if !matches!(event, Event::SystemOff) {
                 stop = Some(event);
