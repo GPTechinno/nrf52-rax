@@ -2,17 +2,17 @@
 
 nRF52 SoC emulator in Rust, one crate for the three chips of the family: nRF52832, nRF52833 and
 nRF52840. The Cortex-M4F is [rax](https://github.com/Georges760/rax)'s Cortex-M core (its
-`feat/cortex-m7` branch: the Private Peripheral Bus as memory, the Floating-point Extension with the
-Cortex-M4F's single-precision identification); around it the memory map and the peripheral models of
-the nRF52 Product Specifications. Board emulators build on it: they drive the pins, put bytes on the
-UART lines, attach devices to the I2C buses, and see the pin levels (with a watcher called on every
-change), the bytes the UARTEs send and what the firmware leaves in the flash.
+`feat/cortex-m4f` branch, our additions not upstream yet: the Private Peripheral Bus as memory,
+the Floating-point Extension with the Cortex-M4F's FPv4-SP-D16); around it the memory map and the
+peripheral models of the nRF52 Product Specifications. Board emulators build on it: they drive the
+pins, put bytes on the UART lines, attach devices to the I2C buses, and see the pin levels (with a
+watcher called on every change), the bytes the UARTEs send and what the firmware leaves in the flash.
 
 ## Building
 
-rax is not on crates.io yet, so this crate takes it by path from `../../upstream/rax`: a checkout of
-its `feat/cortex-m7` branch in an `upstream` directory beside the `emulator` directory holding this
-crate. devenv (stable Rust).
+rax is not on crates.io yet, so this crate takes it from git: the `feat/cortex-m4f` branch of
+[Georges760/rax](https://github.com/Georges760/rax). Cargo checks out the whole repository, its
+research documents included: about 3.5 GB in `~/.cargo/git`. devenv (stable Rust).
 
 ## Use
 

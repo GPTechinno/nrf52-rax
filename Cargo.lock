@@ -828,6 +828,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 [[package]]
 name = "rax"
 version = "0.1.0"
+source = "git+https://github.com/Georges760/rax?branch=feat%2Fcortex-m4f#e1d857aa8812a1e68cf018326a3607c609f37d32"
 dependencies = [
  "bitflags",
  "clap",
