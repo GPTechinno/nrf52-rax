@@ -63,13 +63,15 @@ once, and the stack's events wait for `sd_ble_evt_get` with SWI2/EGU2 pended, as
 - the firmware as a central: the board's peripheral (`peer`, a `Peer` with its GATT table and its
   address, reachable while `present`), which the firmware connects to through its whitelist,
   discovers (primary services, characteristics, descriptors), reads, writes (`host`) and receives
-  notifications from (`peer_notify`).
+  notifications from (`peer_notify`). A firmware that scans gets reports of the peer's
+  advertising data and scan response (`Peer::advertising`) while it is present, one per scan
+  interval, each pausing the scan until the buffer is handed back, and the scan timeout.
 
 What the board's end sends reaches the firmware a connection interval (15 ms) later, in order. One
 connection; GAP and GATT calls that change nothing the model keeps (connection parameters, PHY, data
 length, TX power, configuration) succeed; the device name is kept and read back; the SoC calls act on the peripherals (PPI, POWER, CLOCK,
 the flash through the NVMC). Not modelled: security (pairing, bonding, encryption), indications,
-L2CAP channels, scan reports, the timeslot API, `sd_ecb_block_encrypt`: they return
+L2CAP channels, the timeslot API, `sd_ecb_block_encrypt`: they return
 `NRF_ERROR_NOT_SUPPORTED` and are logged. Checked with nrf-softdevice applications (embassy), as
 peripheral and as central.
 

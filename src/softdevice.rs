@@ -68,6 +68,10 @@ fn put16(b: &mut [u8], at: usize, v: u16) {
     b[at..at + 2].copy_from_slice(&v.to_le_bytes());
 }
 
+fn put32(b: &mut [u8], at: usize, v: u32) {
+    b[at..at + 4].copy_from_slice(&v.to_le_bytes());
+}
+
 pub const NRF_SUCCESS: u32 = 0;
 pub const NRF_ERROR_NO_MEM: u32 = 4;
 pub const NRF_ERROR_NOT_FOUND: u32 = 5;
@@ -108,6 +112,7 @@ const BLE_LAST: u32 = 191;
 const BLE_GAP_EVT_CONNECTED: u16 = 16;
 const BLE_GAP_EVT_DISCONNECTED: u16 = 17;
 const BLE_GAP_EVT_TIMEOUT: u16 = 27;
+const BLE_GAP_EVT_ADV_REPORT: u16 = 29;
 const BLE_GATTC_EVT_PRIM_SRVC_DISC_RSP: u16 = 48;
 const BLE_GATTC_EVT_CHAR_DISC_RSP: u16 = 50;
 const BLE_GATTC_EVT_DESC_DISC_RSP: u16 = 51;
@@ -121,7 +126,12 @@ const NRF_EVT_FLASH_OPERATION_SUCCESS: u32 = 2;
 
 const BLE_GAP_ROLE_PERIPH: u8 = 1;
 const BLE_GAP_ROLE_CENTRAL: u8 = 2;
+const BLE_GAP_TIMEOUT_SRC_SCAN: u8 = 1;
 const BLE_GAP_TIMEOUT_SRC_CONN: u8 = 2;
+const BLE_CONN_HANDLE_INVALID: u16 = 0xFFFF;
+/// The address a peer with none of its own advertises from: random static,
+/// DA:11:22:33:44:55, least significant byte first.
+const PEER_ADDRESS: [u8; 6] = [0x55, 0x44, 0x33, 0x22, 0x11, 0xDA];
 const BLE_GAP_ADDR_TYPE_RANDOM_STATIC: u8 = 1;
 const BLE_GATT_OP_WRITE_REQ: u8 = 1;
 const BLE_GATT_OP_WRITE_CMD: u8 = 2;
@@ -210,6 +220,23 @@ struct Connection {
     central: bool,
 }
 
+/// A scan the firmware runs: each report pauses it until the firmware hands
+/// the buffer back with `sd_ble_gap_scan_start(NULL, buffer)`.
+#[derive(Clone, Debug)]
+struct Scan {
+    active: bool,
+    /// Picoseconds between reports.
+    interval: u64,
+    /// The buffer the next report is written to: address, length.
+    buffer: (u32, u16),
+    /// When the next report is due; `None` while paused on one.
+    next: Option<u64>,
+    /// Picoseconds; `None` scans until stopped.
+    deadline: Option<u64>,
+    /// The next report is the scan response.
+    response: bool,
+}
+
 /// A connection the firmware is trying to make.
 #[derive(Clone, Debug)]
 struct Connect {
@@ -263,6 +290,10 @@ struct PeerAttr {
 pub struct Peer {
     pub address: Option<[u8; 6]>,
     pub present: bool,
+    /// What it advertises, and its scan response: a firmware that scans gets
+    /// them in reports while the peer is present. Empty, it is not seen.
+    pub adv: Vec<u8>,
+    pub scan_rsp: Vec<u8>,
     attrs: Vec<PeerAttr>,
     next: u16,
 }
@@ -272,9 +303,18 @@ impl Peer {
         Self {
             address,
             present: false,
+            adv: Vec::new(),
+            scan_rsp: Vec::new(),
             attrs: Vec::new(),
             next: 0x10,
         }
+    }
+
+    /// Its advertising data and scan response, for a firmware that scans.
+    pub fn advertising(mut self, adv: &[u8], scan_rsp: &[u8]) -> Self {
+        self.adv = adv.to_vec();
+        self.scan_rsp = scan_rsp.to_vec();
+        self
     }
 
     /// A primary service with its characteristics (UUID, properties); a
@@ -368,6 +408,10 @@ pub struct SoftDevice {
     advertising: bool,
     conn: Option<Connection>,
     connect: Option<Connect>,
+    scan: Option<Scan>,
+    /// The data of the report waiting in the queue, and where it goes: written
+    /// when the firmware fetches the report.
+    report: Option<(u32, Vec<u8>)>,
     whitelist: Vec<[u8; 6]>,
     /// The size of the buffer the firmware last offered `sd_ble_evt_get`.
     capacity: usize,
@@ -383,6 +427,9 @@ pub struct SoftDevice {
     pub quarter_degrees: i32,
     /// The GAP device name, as `sd_ble_gap_device_name_set` left it.
     device_name: Vec<u8>,
+    /// Log every BLE call but `sd_ble_evt_get`: its number, r0-r3 and the
+    /// result, for a board finding out what a firmware asks of the stack.
+    pub trace: bool,
 }
 
 impl Default for SoftDevice {
@@ -409,6 +456,8 @@ impl SoftDevice {
             advertising: false,
             conn: None,
             connect: None,
+            scan: None,
+            report: None,
             whitelist: Vec::new(),
             capacity: 0,
             rng: 0x5EED_0001,
@@ -418,6 +467,7 @@ impl SoftDevice {
             quarter_degrees: 100,
             // the stack's own until the application sets one
             device_name: b"nRF5x".to_vec(),
+            trace: false,
         }
     }
 
@@ -429,6 +479,7 @@ impl SoftDevice {
         fresh.host = self.host;
         fresh.notes = self.notes;
         fresh.quarter_degrees = self.quarter_degrees;
+        fresh.trace = self.trace;
         if self.conn.is_some() {
             fresh.host.push_back(HostEvent::Disconnected);
         }
@@ -483,8 +534,11 @@ impl SoftDevice {
         self.irq = true;
     }
 
-    /// An event the board's end of the link causes: it arrives at the next
-    /// connection event, after those already on their way.
+    /// An event the board's end of the link causes, or the answer to a GATT
+    /// client request: it arrives at the next connection event, after those
+    /// already on their way, never during the call that asked for it (the
+    /// stock Scubajet Remote's nrf_ble_gq pops its request after the call,
+    /// and an answer handled in between freed it twice).
     fn arrive(&mut self, event: Vec<u8>) {
         let due = (self.now + LINK_DELAY).max(self.arriving.back().map_or(0, |a| a.0));
         self.arriving.push_back((due, event));
@@ -493,7 +547,14 @@ impl SoftDevice {
     /// When the next event from the board's end arrives, for the machine to
     /// wake for it.
     pub fn next_arrival(&self) -> Option<u64> {
-        self.arriving.front().map(|a| a.0)
+        let mut t = self.arriving.front().map(|a| a.0);
+        if let Some(s) = self.scan.as_ref() {
+            let seen = self.peer.as_ref().is_some_and(|p| p.present && !p.adv.is_empty());
+            for at in [s.next.filter(|_| seen), s.deadline].into_iter().flatten() {
+                t = Some(t.map_or(at, |x| x.min(at)));
+            }
+        }
+        t
     }
 
     /// An event of `size` bytes, header filled.
@@ -579,6 +640,15 @@ impl SoftDevice {
             BLE_FIRST..=BLE_LAST => self.ble(svc, g, now),
             _ => return false,
         };
+        if self.trace && (BLE_FIRST..=BLE_LAST).contains(&svc) && svc != 97 {
+            self.notes.push(format!(
+                "svc {svc} ({:#x}, {:#x}, {:#x}, {:#x}) -> {r:#x}",
+                g.reg(0),
+                g.reg(1),
+                g.reg(2),
+                g.reg(3)
+            ));
+        }
         g.set_reg(0, r);
         true
     }
@@ -830,12 +900,23 @@ impl SoftDevice {
                 NRF_SUCCESS
             }
             126..=135 => self.unsupported("security (pairing, bonding, encryption)"),
-            // rssi_start, rssi_stop, scan_start, scan_stop
-            136..=139 => NRF_SUCCESS,
+            // rssi_start, rssi_stop
+            136 | 137 => NRF_SUCCESS,
+            138 => self.scan_start(g, a0, a1, now),
+            139 => {
+                if self.scan.take().is_none() {
+                    return NRF_ERROR_INVALID_STATE;
+                }
+                self.report = None;
+                NRF_SUCCESS
+            }
             140 => {
                 if self.conn.is_some() || self.connect.is_some() {
                     return NRF_ERROR_INVALID_STATE;
                 }
+                // connecting stops a scan, as the stack does
+                self.scan = None;
+                self.report = None;
                 let targets = if a0 != 0 {
                     vec![bytes(g, a0 + 1, 6).try_into().unwrap()]
                 } else {
@@ -856,7 +937,17 @@ impl SoftDevice {
                 }
                 NRF_SUCCESS
             }
-            142 => self.unsupported("sd_ble_gap_rssi_get"),
+            // rssi_get(conn, rssi, ch_index): a steady -50 dBm on channel 0
+            142 => {
+                if a0 != 0 || self.conn.is_none() {
+                    return BLE_ERROR_INVALID_CONN_HANDLE;
+                }
+                g.write(a1, &[-50i8 as u8]);
+                if a2 != 0 {
+                    g.write(a2, &[0]);
+                }
+                NRF_SUCCESS
+            }
             // phy_update, data_length_update, and the rest of GAP
             143..=154 => NRF_SUCCESS,
             155 => self.gattc_primary_services(g, a0, a1, a2),
@@ -871,7 +962,7 @@ impl SoftDevice {
                 }
                 let mut e = Self::event(BLE_GATTC_EVT_EXCHANGE_MTU_RSP, 12);
                 put16(&mut e, 10, SERVER_RX_MTU.min(a1 as u16).max(23));
-                self.push(e);
+                self.arrive(e);
                 NRF_SUCCESS
             }
             156..=167 => self.unsupported(&format!("GATT client SVC {svc}")),
@@ -961,8 +1052,100 @@ impl SoftDevice {
         }
         let e = self.events.pop_front().unwrap();
         g.write(dest, &e);
+        // a report's data goes into the buffer the scan was handed
+        if u16::from_le_bytes([e[0], e[1]]) == BLE_GAP_EVT_ADV_REPORT
+            && let Some((at, data)) = self.report.take()
+        {
+            g.write(at, &data);
+        }
         wr16(g, p_len, len);
         NRF_SUCCESS
+    }
+
+    /// `sd_ble_gap_scan_start(params, buffer)`: a new scan, or with no params
+    /// the one paused on a report going on into the buffer handed back.
+    /// Params: active is bit 2 of the first byte, the interval (0.625 ms)
+    /// at +2, the timeout (10 ms, 0 none) at +6.
+    fn scan_start(&mut self, g: &mut dyn Guest, params: u32, data: u32, now: u64) -> u32 {
+        let buffer = (rd32(g, data), rd16(g, data + 4));
+        if params == 0 {
+            return match self.scan.as_mut() {
+                Some(s) if s.next.is_none() => {
+                    s.buffer = buffer;
+                    s.next = Some(now + s.interval);
+                    NRF_SUCCESS
+                }
+                _ => NRF_ERROR_INVALID_STATE,
+            };
+        }
+        if self.scan.is_some() || self.connect.is_some() {
+            return NRF_ERROR_INVALID_STATE;
+        }
+        let interval = u64::from(rd16(g, params + 2)).max(4) * 625_000_000;
+        let timeout = rd16(g, params + 6);
+        self.scan = Some(Scan {
+            active: rd8(g, params) & 4 != 0,
+            interval,
+            buffer,
+            next: Some(now + interval),
+            deadline: (timeout != 0).then(|| now + u64::from(timeout) * 10_000_000_000),
+            response: false,
+        });
+        NRF_SUCCESS
+    }
+
+    /// The scan: a report of the peer when one is due (its advertising data,
+    /// then its scan response if the scan is active), the timeout when it
+    /// comes.
+    fn scan_poll(&mut self, now: u64) {
+        let Some(scan) = self.scan.as_mut() else {
+            return;
+        };
+        if scan.deadline.is_some_and(|d| now >= d) {
+            let buffer = scan.buffer;
+            self.scan = None;
+            self.report = None;
+            let mut e = Self::event(BLE_GAP_EVT_TIMEOUT, 20);
+            put16(&mut e, 4, BLE_CONN_HANDLE_INVALID);
+            e[8] = BLE_GAP_TIMEOUT_SRC_SCAN;
+            // the buffer goes back to the application
+            put32(&mut e, 12, buffer.0);
+            put16(&mut e, 16, buffer.1);
+            self.push(e);
+            return;
+        }
+        let Some(peer) = self.peer.as_ref().filter(|p| p.present && !p.adv.is_empty()) else {
+            return;
+        };
+        if !scan.next.is_some_and(|at| now >= at) {
+            return;
+        }
+        let response = scan.active && scan.response && !peer.scan_rsp.is_empty();
+        let data = if response { &peer.scan_rsp } else { &peer.adv };
+        let n = data.len().min(usize::from(scan.buffer.1));
+        let data = data[..n].to_vec();
+        let address = peer.address.unwrap_or(PEER_ADDRESS);
+        scan.response = scan.active && !response && !peer.scan_rsp.is_empty();
+        scan.next = None;
+        let buffer = scan.buffer;
+        // ble_gap_evt_adv_report_t after the conn handle: type, peer and
+        // direct addresses, PHYs, TX power, RSSI, channel, set and data id,
+        // the data (pointer, length), the aux pointer
+        let mut e = Self::event(BLE_GAP_EVT_ADV_REPORT, 44);
+        put16(&mut e, 4, BLE_CONN_HANDLE_INVALID);
+        // connectable, scannable, and the scan response bit
+        put16(&mut e, 8, if response { 0b1011 } else { 0b0011 });
+        e[10] = BLE_GAP_ADDR_TYPE_RANDOM_STATIC << 1;
+        e[11..17].copy_from_slice(&address);
+        e[24] = 1; // primary PHY 1M, secondary not set
+        e[26] = 127; // TX power not available
+        e[27] = -50i8 as u8; // RSSI
+        e[28] = 37; // channel
+        e[29] = 0xFF; // no advertising set
+        put32(&mut e, 32, buffer.0);
+        put16(&mut e, 36, n as u16);
+        self.report = Some((buffer.0, data));
+        self.push(e);
     }
 
     fn adv_set_configure(
@@ -1115,7 +1298,7 @@ impl SoftDevice {
                 12,
             ),
         };
-        self.push(e);
+        self.arrive(e);
         NRF_SUCCESS
     }
 
@@ -1157,7 +1340,7 @@ impl SoftDevice {
             }
             e
         };
-        self.push(e);
+        self.arrive(e);
         NRF_SUCCESS
     }
 
@@ -1202,7 +1385,7 @@ impl SoftDevice {
             }
             e
         };
-        self.push(e);
+        self.arrive(e);
         NRF_SUCCESS
     }
 
@@ -1235,7 +1418,7 @@ impl SoftDevice {
                 16,
             ),
         };
-        self.push(e);
+        self.arrive(e);
         NRF_SUCCESS
     }
 
@@ -1283,7 +1466,7 @@ impl SoftDevice {
             put16(&mut e, 14, offset);
             put16(&mut e, 16, data.len() as u16);
             e[18..].copy_from_slice(&data);
-            self.push(e);
+            self.arrive(e);
         }
         NRF_SUCCESS
     }
@@ -1333,6 +1516,7 @@ impl SoftDevice {
             let (_, e) = self.arriving.pop_front().unwrap();
             self.push(e);
         }
+        self.scan_poll(now);
         let Some(connect) = self.connect.as_mut() else {
             return;
         };
@@ -1653,6 +1837,77 @@ mod tests {
         assert!(next(&mut sd, &mut ram).is_none());
     }
 
+    /// The firmware scans as nrf_ble_scan does: a report of the peer's
+    /// advertisement, then of its scan response, each pausing the scan until
+    /// the buffer is handed back; connecting ends the scan.
+    #[test]
+    fn a_scan_reports_the_peer_and_waits_for_its_buffer() {
+        // what a BT-Link advertises: appearance 0x1440, flags, DIS, its name;
+        // the NUS UUID in the scan response
+        const ADV: &[u8] = b"\x03\x19\x40\x14\x02\x01\x06\x03\x03\x0a\x18\x0e\x09Scuba BT-Link";
+        const RSP: &[u8] = &[0x11, 0x07, 0x9e, 0xca, 0xdc, 0x24, 0x0e, 0xe5, 0xa9, 0xe0, 0x93, 0xf3, 0xa3, 0xb5, 1, 0, 0x40, 0x6e];
+        let (mut sd, mut ram) = (SoftDevice::new(), Ram::new());
+        svc(&mut sd, &mut ram, 16, &[0, 0]);
+        sd.peer = Some(Peer::new(None).advertising(ADV, RSP));
+        // nrf_ble_scan's defaults: active, 100 ms interval, 50 ms window, no timeout
+        ram.put(0x2000_0100, &[0b100, 1, 0xA0, 0, 0x50, 0, 0, 0]);
+        ram.put(0x2000_0120, &0x2000_0400u32.to_le_bytes());
+        ram.put(0x2000_0124, &31u16.to_le_bytes());
+        assert_eq!(svc(&mut sd, &mut ram, 138, &[0x2000_0100, 0x2000_0120]), NRF_SUCCESS);
+        // resuming a scan that is not paused is refused
+        assert_eq!(svc(&mut sd, &mut ram, 138, &[0, 0x2000_0120]), NRF_ERROR_INVALID_STATE);
+        let interval = 0xA0 * 625_000_000;
+        sd.poll(interval);
+        assert!(next(&mut sd, &mut ram).is_none(), "the peer is not there yet");
+        sd.peer.as_mut().unwrap().present = true;
+        assert_eq!(sd.next_arrival(), Some(interval));
+        sd.poll(interval);
+        let e = next(&mut sd, &mut ram).unwrap();
+        assert_eq!(u16::from_le_bytes([e[0], e[1]]), BLE_GAP_EVT_ADV_REPORT);
+        assert_eq!(u16::from_le_bytes([e[4], e[5]]), BLE_CONN_HANDLE_INVALID);
+        assert_eq!(u16::from_le_bytes([e[8], e[9]]) & 0b1000, 0, "the advertisement");
+        assert_eq!(&e[11..17], &PEER_ADDRESS);
+        assert_eq!(u32::from_le_bytes(e[32..36].try_into().unwrap()), 0x2000_0400);
+        assert_eq!(u16::from_le_bytes([e[36], e[37]]) as usize, ADV.len());
+        assert_eq!(ram.get(0x2000_0400, ADV.len()), ADV);
+        // paused until the buffer comes back
+        sd.poll(3 * interval);
+        assert!(next(&mut sd, &mut ram).is_none());
+        assert_eq!(svc(&mut sd, &mut ram, 138, &[0, 0x2000_0120]), NRF_SUCCESS);
+        let t = sd.next_arrival().unwrap();
+        sd.poll(t);
+        let e = next(&mut sd, &mut ram).unwrap();
+        assert_ne!(u16::from_le_bytes([e[8], e[9]]) & 0b1000, 0, "the scan response");
+        assert_eq!(ram.get(0x2000_0400, RSP.len()), RSP);
+        // connecting stops the scan
+        ram.put(0x2000_0140, &[40, 0, 200, 0, 0, 0, 0x90, 1]);
+        let mut addr = [BLE_GAP_ADDR_TYPE_RANDOM_STATIC << 1, 0, 0, 0, 0, 0, 0];
+        addr[1..].copy_from_slice(&PEER_ADDRESS);
+        ram.put(0x2000_0160, &addr);
+        assert_eq!(svc(&mut sd, &mut ram, 140, &[0x2000_0160, 0x2000_0100, 0x2000_0140, 1]), NRF_SUCCESS);
+        assert_eq!(svc(&mut sd, &mut ram, 139, &[]), NRF_ERROR_INVALID_STATE);
+        let e = next(&mut sd, &mut ram).unwrap();
+        assert_eq!(u16::from_le_bytes([e[0], e[1]]), BLE_GAP_EVT_CONNECTED);
+    }
+
+    #[test]
+    fn a_scan_times_out_and_gives_its_buffer_back() {
+        let (mut sd, mut ram) = (SoftDevice::new(), Ram::new());
+        svc(&mut sd, &mut ram, 16, &[0, 0]);
+        // passive, 50 ms interval, 2 s timeout
+        ram.put(0x2000_0100, &[0, 1, 0x50, 0, 0x50, 0, 200, 0]);
+        ram.put(0x2000_0120, &0x2000_0400u32.to_le_bytes());
+        ram.put(0x2000_0124, &31u16.to_le_bytes());
+        assert_eq!(svc(&mut sd, &mut ram, 138, &[0x2000_0100, 0x2000_0120]), NRF_SUCCESS);
+        assert_eq!(sd.next_arrival(), Some(2_000_000_000_000));
+        sd.poll(2_000_000_000_000);
+        let e = next(&mut sd, &mut ram).unwrap();
+        assert_eq!(u16::from_le_bytes([e[0], e[1]]), BLE_GAP_EVT_TIMEOUT);
+        assert_eq!(e[8], BLE_GAP_TIMEOUT_SRC_SCAN);
+        assert_eq!(u32::from_le_bytes(e[12..16].try_into().unwrap()), 0x2000_0400);
+        assert_eq!(svc(&mut sd, &mut ram, 139, &[]), NRF_ERROR_INVALID_STATE);
+    }
+
     /// The firmware as a central: it connects through its whitelist to the
     /// board's peer once present, discovers the NUS, subscribes, writes.
     #[test]
@@ -1687,6 +1942,7 @@ mod tests {
         assert!(next(&mut sd, &mut ram).is_none());
         sd.peer.as_mut().unwrap().present = true;
         sd.poll(2);
+        settle(&mut sd);
         let e = next(&mut sd, &mut ram).unwrap();
         assert_eq!(u16::from_le_bytes([e[0], e[1]]), BLE_GAP_EVT_CONNECTED);
         assert_eq!(&e[9..15], &link);
@@ -1699,6 +1955,7 @@ mod tests {
             svc(&mut sd, &mut ram, 155, &[0, 1, 0x2000_0200]),
             NRF_SUCCESS
         );
+        settle(&mut sd);
         let e = next(&mut sd, &mut ram).unwrap();
         assert_eq!(
             u16::from_le_bytes([e[0], e[1]]),
@@ -1718,6 +1975,7 @@ mod tests {
         put16(&mut range, 2, end);
         ram.put(0x2000_0300, &range);
         svc(&mut sd, &mut ram, 157, &[0, 0x2000_0300]);
+        settle(&mut sd);
         let e = next(&mut sd, &mut ram).unwrap();
         assert_eq!(u16::from_le_bytes([e[10], e[11]]), 2);
         assert_eq!(e[12 + 4], PROP_WRITE | PROP_WRITE_WITHOUT_RESPONSE);
@@ -1728,6 +1986,7 @@ mod tests {
         // the TX descriptors: its CCCD
         ram.put(0x2000_0300, &[0x15, 0, 0x15, 0]);
         svc(&mut sd, &mut ram, 158, &[0, 0x2000_0300]);
+        settle(&mut sd);
         let e = next(&mut sd, &mut ram).unwrap();
         assert_eq!(u16::from_le_bytes([e[10], e[11]]), 1);
         assert_eq!(&e[12..17], &[0x15, 0, 0x02, 0x29, BLE_UUID_TYPE_BLE]);
@@ -1744,6 +2003,7 @@ mod tests {
         };
         write(&mut ram, BLE_GATT_OP_WRITE_REQ, 0x15, &[1, 0]);
         assert_eq!(svc(&mut sd, &mut ram, 163, &[0, 0x2000_0410]), NRF_SUCCESS);
+        settle(&mut sd);
         let e = next(&mut sd, &mut ram).unwrap();
         assert_eq!(u16::from_le_bytes([e[0], e[1]]), BLE_GATTC_EVT_WRITE_RSP);
         assert!(sd.peer.as_ref().unwrap().subscribed(0x14));
@@ -1763,6 +2023,7 @@ mod tests {
         );
 
         assert!(sd.peer_notify(0x14, b"xyz"));
+        settle(&mut sd);
         settle(&mut sd);
         let e = next(&mut sd, &mut ram).unwrap();
         assert_eq!(u16::from_le_bytes([e[0], e[1]]), BLE_GATTC_EVT_HVX);
