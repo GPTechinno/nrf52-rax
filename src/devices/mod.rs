@@ -15,6 +15,7 @@ pub mod misc;
 pub mod ppi;
 pub mod regfile;
 pub mod rtc;
+pub mod saadc;
 pub mod spi;
 pub mod timer;
 pub mod twi;
@@ -32,6 +33,7 @@ use misc::{Egu, Rng, Temp, Wdt};
 use ppi::Ppi;
 use regfile::{RegFile, sub_read, sub_write};
 use rtc::Rtc;
+use saadc::Saadc;
 use spi::{Spi, SpiBus};
 use timer::Timer;
 use twi::Twi;
@@ -119,10 +121,11 @@ pub const ID_PPI: u32 = 31;
 pub const ID_UARTE1: u32 = 40;
 
 /// The peripherals modelled as [`Device`]s, by ID.
-const DEVICES: [u32; 21] = [
+const DEVICES: [u32; 22] = [
     0,  // CLOCK, POWER
     2,  // UARTE0
     6,  // GPIOTE
+    7,  // SAADC
     8,  // TIMER0
     9,  // TIMER1
     10, // TIMER2
@@ -180,6 +183,7 @@ pub struct Peripherals {
     pub timers: Vec<Timer>,
     /// RTC0-2.
     pub rtc: Vec<Rtc>,
+    pub saadc: Saadc,
     pub temp: Temp,
     pub rng: Rng,
     pub wdt: Wdt,
@@ -229,6 +233,7 @@ impl Peripherals {
             gpiote: Gpiote::new(),
             timers: [4, 4, 4, 6, 6].into_iter().map(Timer::new).collect(),
             rtc: [3, 4, 4].into_iter().map(Rtc::new).collect(),
+            saadc: Saadc::new(),
             temp: Temp::new(),
             rng: Rng::new(seed),
             wdt: Wdt::new(),
@@ -269,6 +274,11 @@ impl Peripherals {
         fresh.power = power;
         fresh.i2c = std::mem::take(&mut self.i2c);
         fresh.spi = std::mem::take(&mut self.spi);
+        // the board's analog side and temperature stay as the board set them
+        fresh.saadc.ain = self.saadc.ain;
+        fresh.saadc.vdd = self.saadc.vdd;
+        fresh.saadc.vddh = self.saadc.vddh;
+        fresh.temp.quarter_degrees = self.temp.quarter_degrees;
         fresh.watcher = self.watcher.take();
         fresh.trace = self.trace;
         fresh.log = std::mem::take(&mut self.log);
@@ -296,6 +306,7 @@ impl Peripherals {
             0 => &mut self.power,
             2 => &mut self.uarte[0],
             6 => &mut self.gpiote,
+            7 => &mut self.saadc,
             8..=10 => &mut self.timers[(id - 8) as usize],
             11 => &mut self.rtc[0],
             12 => &mut self.temp,

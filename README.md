@@ -89,12 +89,13 @@ peripheral and as central.
 | UARTE0-1 | baud rate and frame from BAUDRATE and CONFIG, EasyDMA receive (RXDRDY, ENDRX, the 4-byte FIFO, STOPRX then RXTO, FLUSHRX, overrun) and transmit (TXDRDY, ENDTX, STOPTX) |
 | TWIM0-1 | EasyDMA write and read phases with the address, their bus time from FREQUENCY, LASTTX/LASTRX and their shorts, SUSPEND, STOP, address and data NACKs |
 | TWI0-1 (legacy) | a byte at a time through TXD and RXD on the same buses and devices as the TWIM, the BB_SUSPEND and BB_STOP shorts, address and data NACKs |
+| SAADC | eight channels, single-ended or differential, gain, reference, TACQ, resolution; one conversion per enabled channel per SAMPLE, OVERSAMPLE averaged (BURST or one per SAMPLE), SAMPLERATE timer mode; EasyDMA into RESULT.PTR with STARTED, DONE, RESULTDONE, END, STOPPED, CALIBRATEDONE and the LIMIT events; the board sets the voltages on AIN0-7, VDD and VDDH |
 | SPI0-2 (legacy) | a byte at a time through the double-buffered TXD and RXD, at FREQUENCY, READY per byte; devices on the board's buses, each selected by the GPIO its chip select is wired to |
 | EGU0-5, RNG, TEMP, WDT | triggers; random bytes every 30 µs (120 µs with bias correction); the board's temperature 36 µs after START; the watchdog's timeout and reset |
 | Others | registers that keep what is written; the first access to each is logged with its PC |
 
 Not modelled: the RADIO and the crypto blocks (ECB, CCM, AAR), so a SoftDevice image does not run
-(its model above stands in for it); SPIM, SPIS, TWIS and the legacy UART; SAADC, PWM,
+(its model above stands in for it); SPIM, SPIS, TWIS and the legacy UART; PWM,
 QDEC, COMP, PDM, I2S, NFCT, USBD, QSPI; the EasyDMA list mode; clock stretching; the MPU (stored, not
 enforced) and the MWU; RAM retention settings in System OFF (the RAM is kept); the CPU stalls of
 flash programming.
