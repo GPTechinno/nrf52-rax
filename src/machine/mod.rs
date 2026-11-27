@@ -34,7 +34,7 @@ pub use bus::{CODE_RAM, FICR, RAM_BASE, UICR};
 
 use crate::devices::clock::{RESET_DOG, RESET_SREQ};
 use crate::devices::{Clock, Dma, Peripherals};
-use crate::softdevice::{EVENT_IRQ, Guest, SoftDevice};
+use crate::softdevice::{EVENT_IRQ, EVENT_IRQ_PRIORITY, Guest, SoftDevice};
 use crate::variant::Variant;
 
 /// Instructions between two looks at the peripherals.
@@ -378,8 +378,13 @@ impl Nrf52 {
         let answered = match self.softdevice.as_mut() {
             Some(sd) => {
                 let answered = sd.call(imm, &mut CoreGuest(&mut self.cpu), now);
+                let enabled = sd.take_enabled();
                 if sd.take_irq() {
                     self.cpu.nvic_mut().set_pending(EVENT_IRQ);
+                }
+                if enabled {
+                    // IPR bytes are MSB-aligned; the nRF52 implements three bits
+                    self.cpu.nvic_mut().set_priority(EVENT_IRQ, EVENT_IRQ_PRIORITY << 5);
                 }
                 answered
             }

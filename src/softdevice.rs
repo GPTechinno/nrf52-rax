@@ -81,6 +81,14 @@ pub const BLE_ERROR_GATTS_INVALID_ATTR_TYPE: u32 = 0x3400;
 
 /// The interrupt the stack pends when it has an event: SWI2/EGU2.
 pub const EVENT_IRQ: u16 = 22;
+/// The priority the stack gives [`EVENT_IRQ`] when it is enabled, before the
+/// application enables the interrupt: nRF5 SDK's `nrf_sdh.c` says so ("Interrupt
+/// priority has already been set by the stack") and checks it in
+/// `sd_nvic_EnableIRQ`, whose inline refuses the levels the stack keeps (0, 1,
+/// 4) with NRF_ERROR_SOC_NVIC_INTERRUPT_PRIORITY_NOT_ALLOWED. Which of the
+/// others the stack picks is not in its specification as read here: 6, the
+/// SDK's APP_IRQ_PRIORITY_LOW, passes the check.
+pub const EVENT_IRQ_PRIORITY: u8 = 6;
 
 /// `svc #0` is not the SoftDevice's: the MBR passes it to the bootloader,
 /// whose SVCI handler dispatches on r12 (the SDK's `nrf_svci`, used by the
@@ -342,6 +350,8 @@ impl Peer {
 
 pub struct SoftDevice {
     enabled: bool,
+    /// Enabled by the last call: the machine then sets [`EVENT_IRQ_PRIORITY`].
+    just_enabled: bool,
     events: VecDeque<Vec<u8>>,
     /// Events from the board's end of the link, with the time they arrive.
     arriving: VecDeque<(u64, Vec<u8>)>,
@@ -371,6 +381,8 @@ pub struct SoftDevice {
     pub notes: Vec<String>,
     /// The die temperature `sd_temp_get` reports, in 0.25 °C.
     pub quarter_degrees: i32,
+    /// The GAP device name, as `sd_ble_gap_device_name_set` left it.
+    device_name: Vec<u8>,
 }
 
 impl Default for SoftDevice {
@@ -383,6 +395,7 @@ impl SoftDevice {
     pub fn new() -> Self {
         Self {
             enabled: false,
+            just_enabled: false,
             events: VecDeque::new(),
             arriving: VecDeque::new(),
             now: 0,
@@ -403,6 +416,8 @@ impl SoftDevice {
             host: VecDeque::new(),
             notes: Vec::new(),
             quarter_degrees: 100,
+            // the stack's own until the application sets one
+            device_name: b"nRF5x".to_vec(),
         }
     }
 
@@ -428,6 +443,12 @@ impl SoftDevice {
 
     pub fn enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Whether the last calls enabled the stack: the machine then gives
+    /// [`EVENT_IRQ`] the stack's priority, [`EVENT_IRQ_PRIORITY`].
+    pub fn take_enabled(&mut self) -> bool {
+        std::mem::take(&mut self.just_enabled)
     }
 
     pub fn connected(&self) -> bool {
@@ -526,6 +547,7 @@ impl SoftDevice {
         let r = match svc {
             SD_SOFTDEVICE_ENABLE => {
                 self.enabled = true;
+                self.just_enabled = true;
                 if self.address.is_none() {
                     // FICR.DEVICEADDR, a random static address
                     let low = rd32(g, 0x1000_00A4);
@@ -767,9 +789,16 @@ impl SoftDevice {
                 }
                 NRF_SUCCESS
             }
-            // conn_param_update, tx_power_set, appearance_set, ppcp_set,
-            // device_name_set
-            117 | 119 | 120 | 122 | 124 => NRF_SUCCESS,
+            // conn_param_update, tx_power_set, appearance_set, ppcp_set
+            117 | 119 | 120 | 122 => NRF_SUCCESS,
+            // device_name_set(write_perm, name, len)
+            124 => {
+                if a2 > 248 {
+                    return NRF_ERROR_DATA_SIZE;
+                }
+                self.device_name = bytes(g, a1, a2 as usize);
+                NRF_SUCCESS
+            }
             118 => {
                 if a0 != 0 || self.conn.is_none() {
                     return BLE_ERROR_INVALID_CONN_HANDLE;
@@ -785,7 +814,21 @@ impl SoftDevice {
                 g.write(a0, &[0; 8]);
                 NRF_SUCCESS
             }
-            125 => self.unsupported("sd_ble_gap_device_name_get"),
+            // device_name_get(name, len): the length back in *len, the name
+            // copied when there is a buffer and it is large enough
+            125 => {
+                let n = self.device_name.len() as u16;
+                let room = rd16(g, a1);
+                wr16(g, a1, n);
+                if a0 == 0 {
+                    return NRF_SUCCESS;
+                }
+                if room < n {
+                    return NRF_ERROR_DATA_SIZE;
+                }
+                g.write(a0, &self.device_name.clone());
+                NRF_SUCCESS
+            }
             126..=135 => self.unsupported("security (pairing, bonding, encryption)"),
             // rssi_start, rssi_stop, scan_start, scan_stop
             136..=139 => NRF_SUCCESS,
@@ -1751,5 +1794,35 @@ mod tests {
         let mut ram = Ram::new();
         assert_eq!(svc(&mut sd, &mut ram, 0, &[0x2000_0100]), NRF_SUCCESS);
         assert!(sd.notes.iter().any(|n| n.starts_with("SVCI call")));
+    }
+
+    /// The name set is the name got; a short buffer gets the length only.
+    #[test]
+    fn the_device_name_comes_back_as_it_was_set() {
+        let mut sd = SoftDevice::new();
+        let mut ram = Ram::new();
+        let (name, len, buf) = (RAM + 0x100, RAM + 0x200, RAM + 0x300);
+        ram.put(len, &32u16.to_le_bytes());
+        assert_eq!(svc(&mut sd, &mut ram, 125, &[buf, len]), NRF_SUCCESS);
+        assert_eq!((ram.u16(len), ram.get(buf, 5)), (5, &b"nRF5x"[..]));
+        ram.put(name, b"SJ Remote");
+        assert_eq!(svc(&mut sd, &mut ram, 124, &[0, name, 9]), NRF_SUCCESS);
+        ram.put(len, &4u16.to_le_bytes());
+        assert_eq!(svc(&mut sd, &mut ram, 125, &[buf, len]), NRF_ERROR_DATA_SIZE);
+        assert_eq!(ram.u16(len), 9);
+        assert_eq!(svc(&mut sd, &mut ram, 125, &[buf, len]), NRF_SUCCESS);
+        assert_eq!(ram.get(buf, 9), b"SJ Remote");
+    }
+
+    /// The stack sets its event interrupt's priority when enabled; the machine
+    /// learns it once.
+    #[test]
+    fn enabling_is_reported_once_for_the_event_priority() {
+        let mut sd = SoftDevice::new();
+        let mut ram = Ram::new();
+        assert!(!sd.take_enabled());
+        assert_eq!(svc(&mut sd, &mut ram, SD_SOFTDEVICE_ENABLE, &[0x2000_0100, 0]), NRF_SUCCESS);
+        assert!(sd.take_enabled());
+        assert!(!sd.take_enabled());
     }
 }

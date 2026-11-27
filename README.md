@@ -53,7 +53,8 @@ cargo run --release --example run -- --variant 52833 --boot 27000 --softdevice b
 The RADIO is not modelled, so a SoftDevice image cannot run. `Config::softdevice` puts a model of
 one in its place, at its interface (S132/S140 7.x): an application linked above a SoftDevice boots
 at its own address with no SoftDevice image, each `svc #n` it makes (the `sd_*` calls) is answered at
-once, and the stack's events wait for `sd_ble_evt_get` with SWI2/EGU2 pended, as with the real one.
+once, and the stack's events wait for `sd_ble_evt_get` with SWI2/EGU2 pended, as with the real one
+(whose priority it sets to 6 when enabled, as the stack does before `sd_nvic_EnableIRQ` checks it).
 `softdevice()` gives the board the other end of the BLE connection:
 
 - the firmware as a peripheral: its GATT server (`characteristic`), its advertising set
@@ -66,7 +67,7 @@ once, and the stack's events wait for `sd_ble_evt_get` with SWI2/EGU2 pended, as
 
 What the board's end sends reaches the firmware a connection interval (15 ms) later, in order. One
 connection; GAP and GATT calls that change nothing the model keeps (connection parameters, PHY, data
-length, TX power, configuration) succeed; the SoC calls act on the peripherals (PPI, POWER, CLOCK,
+length, TX power, configuration) succeed; the device name is kept and read back; the SoC calls act on the peripherals (PPI, POWER, CLOCK,
 the flash through the NVMC). Not modelled: security (pairing, bonding, encryption), indications,
 L2CAP channels, scan reports, the timeslot API, `sd_ecb_block_encrypt`: they return
 `NRF_ERROR_NOT_SUPPORTED` and are logged. Checked with nrf-softdevice applications (embassy), as
