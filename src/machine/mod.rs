@@ -220,6 +220,23 @@ impl Nrf52 {
         self.reset_chip(crate::devices::clock::RESET_PIN);
     }
 
+    /// The supply comes back after going away: a power-on reset. The RAM is
+    /// lost (it reads zero), RESETREAS and the retained registers read zero,
+    /// the bytes on the UART lines are gone; the flash and the UICR stay, and
+    /// so does the board's side (pin inputs, I2C devices, the watcher).
+    /// Between [`Nrf52::run_for`] calls the board decides when the supply is
+    /// there; nothing runs while it is not.
+    pub fn power_on(&mut self) {
+        let ram = vec![0u8; self.variant.ram_size()];
+        let _ = self.cpu.memory_mut().write(u64::from(RAM_BASE), &ram);
+        self.periph().power_on_reset();
+        self.softdevice = self.softdevice.take().map(SoftDevice::after_reset);
+        self.cpu.reset();
+        self.off = false;
+        self.resets.push(0);
+        self.service();
+    }
+
     pub fn periph(&self) -> MutexGuard<'_, Peripherals> {
         self.periph.lock().unwrap_or_else(|e| e.into_inner())
     }

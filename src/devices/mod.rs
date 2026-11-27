@@ -231,8 +231,21 @@ impl Peripherals {
     /// board's side stays: the pin inputs, the I2C buses, the watcher, the
     /// bytes on the UART lines.
     pub fn reset(&mut self, reason: u32) {
+        let power = self.power.after_reset(reason);
+        self.renew(power, true);
+    }
+
+    /// The peripherals after a power-on reset, the supply having gone away:
+    /// as [`Peripherals::reset`], but POWER as at power-on (RESETREAS and the
+    /// retained registers zero) and the UART lines empty, what was on them
+    /// lost with the supply.
+    pub fn power_on_reset(&mut self) {
+        self.renew(ClockPower::new(), false);
+    }
+
+    fn renew(&mut self, power: ClockPower, keep_lines: bool) {
         let mut fresh = Self::new(self.clock.clone(), self.variant, self.rng.byte_seed());
-        fresh.power = self.power.after_reset(reason);
+        fresh.power = power;
         fresh.i2c = std::mem::take(&mut self.i2c);
         fresh.watcher = self.watcher.take();
         fresh.trace = self.trace;
@@ -241,9 +254,11 @@ impl Peripherals {
             new.input = old.input;
             new.driven = old.driven;
         }
-        for (new, old) in fresh.uarte.iter_mut().zip(self.uarte.iter_mut()) {
-            new.line_in = std::mem::take(&mut old.line_in);
-            new.line_out = std::mem::take(&mut old.line_out);
+        if keep_lines {
+            for (new, old) in fresh.uarte.iter_mut().zip(self.uarte.iter_mut()) {
+                new.line_in = std::mem::take(&mut old.line_in);
+                new.line_out = std::mem::take(&mut old.line_out);
+            }
         }
         *self = fresh;
         self.sync_pins();
@@ -709,5 +724,20 @@ pub mod tests {
         // P1 has 10 pins on the nRF52833
         p.write(0x5000_0804, 4, u32::MAX);
         assert_eq!(p.read(0x5000_0804, 4), Some(0x3FF));
+    }
+
+    /// A system reset keeps RESETREAS and the retained registers, and a
+    /// board that powers its chip in bursts needs the other kind: the supply
+    /// coming back clears them.
+    #[test]
+    fn a_power_on_reset_forgets_what_a_system_reset_keeps() {
+        let mut p = peripherals();
+        p.write(0x4000_051C, 4, 0x2A); // GPREGRET
+        p.reset(clock::RESET_SREQ);
+        assert_eq!(p.read(0x4000_0400, 4), Some(clock::RESET_SREQ));
+        assert_eq!(p.read(0x4000_051C, 4), Some(0x2A));
+        p.power_on_reset();
+        assert_eq!(p.read(0x4000_0400, 4), Some(0), "RESETREAS");
+        assert_eq!(p.read(0x4000_051C, 4), Some(0), "GPREGRET");
     }
 }
