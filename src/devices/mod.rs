@@ -16,6 +16,7 @@ pub mod ppi;
 pub mod regfile;
 pub mod rtc;
 pub mod timer;
+pub mod twi;
 pub mod twim;
 pub mod uarte;
 
@@ -31,6 +32,7 @@ use ppi::Ppi;
 use regfile::{RegFile, sub_read, sub_write};
 use rtc::Rtc;
 use timer::Timer;
+use twi::Twi;
 use twim::{I2cBus, Twim};
 use uarte::Uarte;
 
@@ -131,11 +133,20 @@ const DEVICES: [u32; 21] = [
 ];
 
 /// Peripheral ID 3 or 4: TWIM, SPIM, SPIS, TWIS or the legacy TWI and SPI,
-/// picked by ENABLE. Only the TWIM is modelled (and holds the registers
-/// while the instance is disabled); the others keep their registers.
+/// picked by ENABLE. The TWIM (6) and the legacy TWI (5) are modelled, the
+/// TWIM holding the registers while the instance is disabled; the others
+/// keep their registers.
 pub struct Serial {
     pub twim: Twim,
+    pub twi: Twi,
     regs: RegFile,
+}
+
+impl Serial {
+    /// Whether the legacy TWI is the instance.
+    fn is_twi(&self) -> bool {
+        self.twim.enable == twi::ENABLED
+    }
 }
 
 const ENABLE: u32 = 0x500;
@@ -192,6 +203,7 @@ impl Peripherals {
             uarte: (0..uartes).map(|_| Uarte::new(dma)).collect(),
             serial: [0, 1].map(|_| Serial {
                 twim: Twim::new(dma),
+                twi: Twi::new(),
                 regs: RegFile::default(),
             }),
             gpiote: Gpiote::new(),
@@ -276,6 +288,8 @@ impl Peripherals {
             for serial in &mut self.serial {
                 if serial.twim.enabled() {
                     next = earliest(next, serial.twim.update(&ctx, mem, &mut self.i2c));
+                } else if serial.is_twi() {
+                    next = earliest(next, serial.twi.update(&ctx, &mut self.i2c));
                 }
             }
             if !self.route() {
@@ -303,6 +317,7 @@ impl Peripherals {
         }
         for (i, serial) in self.serial.iter_mut().enumerate() {
             fired.push((ID_SERIAL0 + i as u32, serial.twim.events.take_fired()));
+            fired.push((ID_SERIAL0 + i as u32, serial.twi.events.take_fired()));
         }
         for (id, mask) in fired {
             let base = PERIPHERALS + 0x1000 * id;
@@ -327,7 +342,9 @@ impl Peripherals {
             }
         }
         for (i, serial) in self.serial.iter().enumerate() {
-            if serial.twim.enabled() && serial.twim.events.irq() {
+            if (serial.twim.enabled() && serial.twim.events.irq())
+                || (serial.is_twi() && serial.twi.events.irq())
+            {
                 lines.push((ID_SERIAL0 + i as u32) as u16);
             }
         }
@@ -457,6 +474,9 @@ impl Peripherals {
                         if serial.twim.enable == 0 || serial.twim.enabled() || offset == ENABLE {
                             return Some(serial.twim.read(offset));
                         }
+                        if serial.is_twi() {
+                            return Some(serial.twi.read(offset));
+                        }
                         if serial.regs.first(offset) {
                             self.note("read", a);
                         }
@@ -512,8 +532,16 @@ impl Peripherals {
                 match id {
                     ID_SERIAL0 | ID_SERIAL1 => {
                         let serial = &mut self.serial[(id - ID_SERIAL0) as usize];
+                        if offset == ENABLE || serial.twim.enable == 0 {
+                            // ENABLE, and what a driver sets before it (pins,
+                            // frequency, address), serve whichever instance
+                            // ENABLE picks: the TWI keeps its own copy
+                            serial.twi.write(offset, word, &ctx);
+                        }
                         if serial.twim.enable == 0 || serial.twim.enabled() || offset == ENABLE {
                             serial.twim.write(offset, word, &ctx);
+                        } else if serial.is_twi() {
+                            serial.twi.write(offset, word, &ctx);
                         } else {
                             if serial.regs.first(offset) {
                                 self.note("write", a);
