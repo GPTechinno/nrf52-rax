@@ -82,6 +82,11 @@ pub const BLE_ERROR_GATTS_INVALID_ATTR_TYPE: u32 = 0x3400;
 /// The interrupt the stack pends when it has an event: SWI2/EGU2.
 pub const EVENT_IRQ: u16 = 22;
 
+/// `svc #0` is not the SoftDevice's: the MBR passes it to the bootloader,
+/// whose SVCI handler dispatches on r12 (the SDK's `nrf_svci`, used by the
+/// buttonless DFU service to set the bootloader's advertising name and peer
+/// data, and by their `_init` calls at start-up).
+const NRF_SVCI_SVC_NUM: u32 = 0;
 const SD_SOFTDEVICE_ENABLE: u32 = 16;
 const SD_SOFTDEVICE_DISABLE: u32 = 17;
 const SD_SOFTDEVICE_IS_ENABLED: u32 = 18;
@@ -541,6 +546,13 @@ impl SoftDevice {
                 NRF_SUCCESS
             }
             SD_SOFTDEVICE_VECTOR_TABLE_BASE_SET => NRF_SUCCESS,
+            // Answered as a bootloader that accepts every SVCI call; nothing
+            // runs, so a DFU it would start never starts.
+            NRF_SVCI_SVC_NUM => {
+                let n = g.reg(12);
+                self.note(format!("SVCI call {n:#x} answered as a bootloader would"));
+                NRF_SUCCESS
+            }
             SOC_FIRST..=SOC_LAST => self.soc(svc, g),
             BLE_FIRST..=BLE_LAST => self.ble(svc, g, now),
             _ => return false,
@@ -1386,10 +1398,10 @@ impl SoftDevice {
 mod tests {
     use super::*;
 
-    /// 64 KB of RAM at 0x2000_0000 and the four argument registers.
+    /// 64 KB of RAM at 0x2000_0000 and R0-R12.
     struct Ram {
         mem: Vec<u8>,
-        regs: [u32; 4],
+        regs: [u32; 13],
     }
 
     const RAM: u32 = 0x2000_0000;
@@ -1398,7 +1410,7 @@ mod tests {
         fn new() -> Self {
             Self {
                 mem: vec![0; 0x1_0000],
-                regs: [0; 4],
+                regs: [0; 13],
             }
         }
         fn at(&self, a: u32) -> usize {
@@ -1438,7 +1450,7 @@ mod tests {
     }
 
     fn svc(sd: &mut SoftDevice, ram: &mut Ram, n: u32, args: &[u32]) -> u32 {
-        ram.regs = [0; 4];
+        ram.regs = [0; 13];
         ram.regs[..args.len()].copy_from_slice(args);
         assert!(sd.call(n, ram, 0));
         ram.regs[0]
@@ -1728,5 +1740,16 @@ mod tests {
         );
         assert_eq!(ram.u16(0x2000_7FF0), 200);
         assert_eq!(sd.max_notification(), 112);
+    }
+
+    /// `svc #0` is the bootloader's SVCI, which the MBR passes on: answered
+    /// as a bootloader that takes the call, which the buttonless DFU
+    /// service's start-up needs (or its error handler resets the chip).
+    #[test]
+    fn an_svci_call_is_taken_as_a_bootloader_would() {
+        let mut sd = SoftDevice::new();
+        let mut ram = Ram::new();
+        assert_eq!(svc(&mut sd, &mut ram, 0, &[0x2000_0100]), NRF_SUCCESS);
+        assert!(sd.notes.iter().any(|n| n.starts_with("SVCI call")));
     }
 }
