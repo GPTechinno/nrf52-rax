@@ -86,6 +86,32 @@ impl Variant {
         }
     }
 
+    /// The ROM table's 4 KB at 0xF000_0000, of which firmware reads only the
+    /// peripheral ID registers: older errata checks of Nordic's MDK and SDK
+    /// tell the chip and its revision from PID0 (0xFE0, the part: 0x06 for
+    /// the nRF52832 and 0x08 for the nRF52840; 0x0D for the nRF52833 [I],
+    /// the code its FICR word 0x130 carries) and from the high nibble of
+    /// PID2 (0xFE8), which reads 0 here: a check for an early nRF52832 (3)
+    /// sees a later chip. The component ID (0xFF0-0xFFC) is CoreSight's.
+    pub fn rom_table(self) -> Vec<u8> {
+        let mut rom = vec![0; 4096];
+        let part = match self {
+            Variant::Nrf52832 => 0x06,
+            Variant::Nrf52833 => 0x0D,
+            Variant::Nrf52840 => 0x08,
+        };
+        for (offset, value) in [
+            (0xFE0, part),
+            (0xFF0, 0x0D),
+            (0xFF4, 0x10),
+            (0xFF8, 0x05),
+            (0xFFC, 0xB1),
+        ] {
+            rom[offset] = value;
+        }
+        rom
+    }
+
     /// The 4 KB of FICR: the code page size and count, the device ID and
     /// address, the part, variant, package, RAM and flash sizes. `device_id`
     /// makes DEVICEID and DEVICEADDR (a random static address); `build` is

@@ -25,6 +25,8 @@ pub const RAM_BASE: u32 = 0x2000_0000;
 pub const CODE_RAM: u32 = 0x0080_0000;
 pub const FICR: u32 = 0x1000_0000;
 pub const UICR: u32 = 0x1000_1000;
+/// The ROM table, read-only: its peripheral ID registers name the chip.
+pub const ROM_TABLE: u32 = 0xF000_0000;
 const INFO_SIZE: usize = 0x1000;
 const NVMC: u32 = 0x4001_E000;
 
@@ -45,6 +47,7 @@ pub struct Bus {
     pub ram: Vec<u8>,
     ficr: Vec<u8>,
     pub uicr: Vec<u8>,
+    rom: Vec<u8>,
     nvmc_config: u32,
     nvmc: RegFile,
     periph: Arc<Mutex<Peripherals>>,
@@ -81,6 +84,7 @@ enum Area {
     Ram,
     Ficr,
     Uicr,
+    Rom,
 }
 
 impl Bus {
@@ -90,6 +94,7 @@ impl Bus {
             ram: vec![0; variant.ram_size()],
             ficr,
             uicr: vec![0xFF; INFO_SIZE],
+            rom: variant.rom_table(),
             nvmc_config: 0,
             nvmc: RegFile::with(&[(0x51C, 0x0A), (0x540, 0x0000_0001)]),
             periph,
@@ -110,6 +115,9 @@ impl Bus {
         if let Some(o) = within(address, len, FICR, INFO_SIZE) {
             return Some((Area::Ficr, o));
         }
+        if let Some(o) = within(address, len, ROM_TABLE, INFO_SIZE) {
+            return Some((Area::Rom, o));
+        }
         within(address, len, UICR, INFO_SIZE).map(|o| (Area::Uicr, o))
     }
 
@@ -119,6 +127,7 @@ impl Bus {
             Area::Ram => &self.ram,
             Area::Ficr => &self.ficr,
             Area::Uicr => &self.uicr,
+            Area::Rom => &self.rom,
         }
     }
 
@@ -132,7 +141,7 @@ impl Bus {
             Area::Flash => &mut self.flash,
             Area::Ram => &mut self.ram,
             Area::Uicr => &mut self.uicr,
-            Area::Ficr => return false,
+            Area::Ficr | Area::Rom => return false,
         };
         target[o..o + bytes.len()].copy_from_slice(bytes);
         true
@@ -257,7 +266,7 @@ impl ArmMemory for Bus {
                 }
                 Ok(())
             }
-            Some((Area::Ficr, _)) => Ok(()),
+            Some((Area::Ficr | Area::Rom, _)) => Ok(()),
             None => self.mmio_write(address, data),
         }
     }
@@ -342,5 +351,17 @@ mod tests {
             bus.read(u64::from(RAM_BASE + (128 << 10)), &mut [0; 4])
                 .is_err()
         );
+    }
+
+    /// The stock Dive Adapter firmware tells the chip by the ROM table's
+    /// PID2 (`(*0xF000_0FE8 & 0xF0) != 0x30`); unmapped, the read faulted.
+    #[test]
+    fn the_rom_table_names_the_chip_and_ignores_writes() {
+        let mut bus = bus();
+        assert_eq!(word(&bus, ROM_TABLE + 0xFE0), 0x0D);
+        assert_eq!(word(&bus, ROM_TABLE + 0xFE8) & 0xF0, 0);
+        assert_eq!(word(&bus, ROM_TABLE + 0xFFC), 0xB1);
+        bus.write(u64::from(ROM_TABLE + 0xFE0), &[0; 4]).unwrap();
+        assert_eq!(word(&bus, ROM_TABLE + 0xFE0), 0x0D, "read-only");
     }
 }
