@@ -163,6 +163,14 @@ const SERVER_RX_MTU: u16 = 247;
 /// event, this long after it is sent (picoseconds): never in the batch that
 /// carried the connection itself.
 const LINK_DELAY: u64 = 15_000_000_000;
+/// Between two packets of one connection event: a notification of a few
+/// dozen bytes, its acknowledgement and the two inter-frame spaces, about a
+/// millisecond on 1M as sniffed (two BT-Link notifications 1 ms apart). The
+/// firmware gets each packet's event in turn, with time to run between them:
+/// the stock Scubajet Remote feeds a notification to its frame receiver in the
+/// event handler and empties it in its main loop, and two delivered at once
+/// lost the second.
+const PACKET_GAP: u64 = 1_000_000_000;
 
 /// A UUID: a Bluetooth SIG 16-bit one, or a vendor 128-bit one in the
 /// order it travels in (little-endian).
@@ -535,12 +543,12 @@ impl SoftDevice {
     }
 
     /// An event the board's end of the link causes, or the answer to a GATT
-    /// client request: it arrives at the next connection event, after those
-    /// already on their way, never during the call that asked for it (the
+    /// client request: it arrives at the next connection event, a packet after
+    /// those already on their way, never during the call that asked for it (the
     /// stock Scubajet Remote's nrf_ble_gq pops its request after the call,
     /// and an answer handled in between freed it twice).
     fn arrive(&mut self, event: Vec<u8>) {
-        let due = (self.now + LINK_DELAY).max(self.arriving.back().map_or(0, |a| a.0));
+        let due = (self.now + LINK_DELAY).max(self.arriving.back().map_or(0, |a| a.0 + PACKET_GAP));
         self.arriving.push_back((due, event));
     }
 
@@ -2030,6 +2038,16 @@ mod tests {
         assert_eq!(u16::from_le_bytes([e[10], e[11]]), 0x14);
         assert_eq!(e[12], BLE_GATT_HVX_NOTIFICATION);
         assert_eq!(&e[16..], b"xyz");
+
+        // two sent at once arrive a packet apart, each with its own event
+        assert!(sd.peer_notify(0x14, b"a") && sd.peer_notify(0x14, b"b"));
+        let first = sd.next_arrival().unwrap();
+        sd.poll(first);
+        assert_eq!(&next(&mut sd, &mut ram).unwrap()[16..], b"a");
+        assert!(next(&mut sd, &mut ram).is_none(), "the second is a packet later");
+        assert_eq!(sd.next_arrival(), Some(first + PACKET_GAP));
+        settle(&mut sd);
+        assert_eq!(&next(&mut sd, &mut ram).unwrap()[16..], b"b");
     }
 
     /// An event larger than the buffer stays queued, its size reported.
