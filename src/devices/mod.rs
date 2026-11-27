@@ -15,6 +15,7 @@ pub mod misc;
 pub mod ppi;
 pub mod regfile;
 pub mod rtc;
+pub mod spi;
 pub mod timer;
 pub mod twi;
 pub mod twim;
@@ -31,6 +32,7 @@ use misc::{Egu, Rng, Temp, Wdt};
 use ppi::Ppi;
 use regfile::{RegFile, sub_read, sub_write};
 use rtc::Rtc;
+use spi::{Spi, SpiBus};
 use timer::Timer;
 use twi::Twi;
 use twim::{I2cBus, Twim};
@@ -103,6 +105,15 @@ pub const ID_CLOCK: u32 = 0;
 pub const ID_UARTE0: u32 = 2;
 pub const ID_SERIAL0: u32 = 3;
 pub const ID_SERIAL1: u32 = 4;
+/// SPIM2, SPIS2, SPI2.
+pub const ID_SERIAL2: u32 = 35;
+/// The serial instances, in the order of [`Peripherals::serial`].
+const SERIAL_IDS: [u32; 3] = [ID_SERIAL0, ID_SERIAL1, ID_SERIAL2];
+
+/// The index in [`Peripherals::serial`] of serial peripheral `id`.
+fn serial_index(id: u32) -> usize {
+    SERIAL_IDS.iter().position(|&s| s == id).unwrap_or(0)
+}
 pub const ID_GPIOTE: u32 = 6;
 pub const ID_PPI: u32 = 31;
 pub const ID_UARTE1: u32 = 40;
@@ -132,13 +143,14 @@ const DEVICES: [u32; 21] = [
     40, // UARTE1
 ];
 
-/// Peripheral ID 3 or 4: TWIM, SPIM, SPIS, TWIS or the legacy TWI and SPI,
-/// picked by ENABLE. The TWIM (6) and the legacy TWI (5) are modelled, the
-/// TWIM holding the registers while the instance is disabled; the others
-/// keep their registers.
+/// Peripheral ID 3, 4 or 35: TWIM, SPIM, SPIS, TWIS or the legacy TWI and SPI,
+/// picked by ENABLE (35 has no TWI). The TWIM (6), the legacy TWI (5) and the
+/// legacy SPI (1) are modelled, the TWIM holding the registers while the
+/// instance is disabled; the others keep their registers.
 pub struct Serial {
     pub twim: Twim,
     pub twi: Twi,
+    pub spi: Spi,
     regs: RegFile,
 }
 
@@ -146,6 +158,10 @@ impl Serial {
     /// Whether the legacy TWI is the instance.
     fn is_twi(&self) -> bool {
         self.twim.enable == twi::ENABLED
+    }
+    /// Whether the legacy SPI is the instance.
+    fn is_spi(&self) -> bool {
+        self.twim.enable == spi::ENABLED
     }
 }
 
@@ -157,8 +173,8 @@ pub struct Peripherals {
     pub power: ClockPower,
     /// UARTE0, and UARTE1 on the nRF52833 and nRF52840.
     pub uarte: Vec<Uarte>,
-    /// IDs 3 and 4.
-    pub serial: [Serial; 2],
+    /// IDs 3, 4 and 35.
+    pub serial: [Serial; 3],
     pub gpiote: Gpiote,
     /// TIMER0-4.
     pub timers: Vec<Timer>,
@@ -174,6 +190,9 @@ pub struct Peripherals {
     pub gpio: Vec<Gpio>,
     /// The board's I2C buses, by the pin of their SCL line (port << 5 | pin).
     pub i2c: BTreeMap<u32, I2cBus>,
+    /// The board's SPI buses, by the pin of their SCK line; each device
+    /// selected by its own chip-select GPIO.
+    pub spi: BTreeMap<u32, SpiBus>,
     pub watcher: Option<Box<dyn PinWatcher>>,
     /// The other blocks of 4 KB, by base address.
     other: BTreeMap<u32, RegFile>,
@@ -201,9 +220,10 @@ impl Peripherals {
             variant,
             power: ClockPower::new(),
             uarte: (0..uartes).map(|_| Uarte::new(dma)).collect(),
-            serial: [0, 1].map(|_| Serial {
+            serial: [0, 1, 2].map(|_| Serial {
                 twim: Twim::new(dma),
                 twi: Twi::new(),
+                spi: Spi::new(),
                 regs: RegFile::default(),
             }),
             gpiote: Gpiote::new(),
@@ -216,6 +236,7 @@ impl Peripherals {
             ppi: Ppi::new(),
             gpio,
             i2c: BTreeMap::new(),
+            spi: BTreeMap::new(),
             watcher: None,
             other: BTreeMap::new(),
             log: Vec::new(),
@@ -247,6 +268,7 @@ impl Peripherals {
         let mut fresh = Self::new(self.clock.clone(), self.variant, self.rng.byte_seed());
         fresh.power = power;
         fresh.i2c = std::mem::take(&mut self.i2c);
+        fresh.spi = std::mem::take(&mut self.spi);
         fresh.watcher = self.watcher.take();
         fresh.trace = self.trace;
         fresh.log = std::mem::take(&mut self.log);
@@ -305,6 +327,9 @@ impl Peripherals {
                     next = earliest(next, serial.twim.update(&ctx, mem, &mut self.i2c));
                 } else if serial.is_twi() {
                     next = earliest(next, serial.twi.update(&ctx, &mut self.i2c));
+                } else if serial.is_spi() {
+                    let bus = self.spi.get_mut(&serial.spi.sck());
+                    next = earliest(next, serial.spi.update(&ctx, bus, &self.levels));
                 }
             }
             if !self.route() {
@@ -330,9 +355,10 @@ impl Peripherals {
                 fired.push((id, device.events().take_fired()));
             }
         }
-        for (i, serial) in self.serial.iter_mut().enumerate() {
-            fired.push((ID_SERIAL0 + i as u32, serial.twim.events.take_fired()));
-            fired.push((ID_SERIAL0 + i as u32, serial.twi.events.take_fired()));
+        for (&id, serial) in SERIAL_IDS.iter().zip(self.serial.iter_mut()) {
+            fired.push((id, serial.twim.events.take_fired()));
+            fired.push((id, serial.twi.events.take_fired()));
+            fired.push((id, serial.spi.events.take_fired()));
         }
         for (id, mask) in fired {
             let base = PERIPHERALS + 0x1000 * id;
@@ -356,11 +382,12 @@ impl Peripherals {
                 lines.push(id as u16);
             }
         }
-        for (i, serial) in self.serial.iter().enumerate() {
+        for (&id, serial) in SERIAL_IDS.iter().zip(self.serial.iter()) {
             if (serial.twim.enabled() && serial.twim.events.irq())
                 || (serial.is_twi() && serial.twi.events.irq())
+                || (serial.is_spi() && serial.spi.events.irq())
             {
-                lines.push((ID_SERIAL0 + i as u32) as u16);
+                lines.push(id as u16);
             }
         }
         lines
@@ -415,6 +442,14 @@ impl Peripherals {
         }
         self.detect = detect;
         if levels != self.levels {
+            // a chip select that moved tells its device
+            for slave in self.spi.values_mut().flatten() {
+                let low = spi::low(&levels, slave.cs);
+                if low != slave.selected {
+                    slave.selected = low;
+                    slave.device.select(low);
+                }
+            }
             let now = self.clock.now();
             if let Some(watcher) = self.watcher.as_mut() {
                 let ports = self.gpio.len();
@@ -484,19 +519,24 @@ impl Peripherals {
                     return Some(device.read(offset, &mut ctx));
                 }
                 match id {
-                    ID_SERIAL0 | ID_SERIAL1 => {
-                        let serial = &mut self.serial[(id - ID_SERIAL0) as usize];
+                    ID_SERIAL0 | ID_SERIAL1 | ID_SERIAL2 => {
+                        let k = serial_index(id);
+                        let serial = &mut self.serial[k];
                         if serial.twim.enable == 0 || serial.twim.enabled() || offset == ENABLE {
                             return Some(serial.twim.read(offset));
                         }
                         if serial.is_twi() {
                             return Some(serial.twi.read(offset));
                         }
+                        if serial.is_spi() {
+                            let value = serial.spi.read(offset);
+                            serial.spi.resume(now);
+                            return Some(value);
+                        }
                         if serial.regs.first(offset) {
                             self.note("read", a);
                         }
-                        let serial = &self.serial[(id - ID_SERIAL0) as usize];
-                        Some(serial.regs.get(offset))
+                        Some(self.serial[k].regs.get(offset))
                     }
                     ID_PPI => Some(self.ppi.read(offset)),
                     _ => Some(self.other_read(a)),
@@ -545,25 +585,27 @@ impl Peripherals {
                     return true;
                 }
                 match id {
-                    ID_SERIAL0 | ID_SERIAL1 => {
-                        let serial = &mut self.serial[(id - ID_SERIAL0) as usize];
+                    ID_SERIAL0 | ID_SERIAL1 | ID_SERIAL2 => {
+                        let k = serial_index(id);
+                        let serial = &mut self.serial[k];
                         if offset == ENABLE || serial.twim.enable == 0 {
                             // ENABLE, and what a driver sets before it (pins,
                             // frequency, address), serve whichever instance
-                            // ENABLE picks: the TWI keeps its own copy
+                            // ENABLE picks: the TWI and the SPI keep copies
                             serial.twi.write(offset, word, &ctx);
+                            serial.spi.write(offset, word, &ctx);
                         }
                         if serial.twim.enable == 0 || serial.twim.enabled() || offset == ENABLE {
                             serial.twim.write(offset, word, &ctx);
                         } else if serial.is_twi() {
                             serial.twi.write(offset, word, &ctx);
+                        } else if serial.is_spi() {
+                            serial.spi.write(offset, word, &ctx);
                         } else {
                             if serial.regs.first(offset) {
                                 self.note("write", a);
                             }
-                            self.serial[(id - ID_SERIAL0) as usize]
-                                .regs
-                                .set(offset, word);
+                            self.serial[k].regs.set(offset, word);
                         }
                     }
                     ID_PPI => self.ppi.write(offset, word),
